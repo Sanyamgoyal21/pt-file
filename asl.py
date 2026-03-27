@@ -3,7 +3,6 @@ import cv2
 import mediapipe as mp
 import urllib.request
 import os
-from collections import deque
 
 # =========================
 # DOWNLOAD MEDIAPIPE MODEL
@@ -17,12 +16,13 @@ if not os.path.exists(model_path):
     print("Download complete.")
 
 # =========================
-# LOAD YOLO MODEL
+# LOAD MODELS
 # =========================
-model = YOLO("best (4).pt")
+letter_model = YOLO("best (4).pt")
+word_model = YOLO("best_word.pt")
 
 # =========================
-# MEDIAPIPE HAND LANDMARKER
+# MEDIAPIPE TASKS API
 # =========================
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -37,15 +37,13 @@ options = HandLandmarkerOptions(
 )
 
 # =========================
-# SMOOTHING BUFFER
-# =========================
-history = deque(maxlen=10)
-
-# =========================
-# START CAMERA
+# CAMERA
 # =========================
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FPS, 15)  # 🔥 reduce lag
+
 timestamp_ms = 0
+frame_count = 0  # 🔥 for skipping frames
 
 with HandLandmarker.create_from_options(options) as landmarker:
 
@@ -54,8 +52,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
         if not ret:
             break
 
-        # 🔥 NEW: track if hand exists
-        hand_detected = False
+        frame_count += 1
 
         h, w, _ = frame.shape
 
@@ -66,18 +63,11 @@ with HandLandmarker.create_from_options(options) as landmarker:
         timestamp_ms += 33
         result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        best_label = None
-        best_conf = 0
-
-        # =========================
-        # HAND DETECTION
-        # =========================
         if result.hand_landmarks:
-            hand_detected = True   # 🔥 NEW
 
             for hand_landmarks in result.hand_landmarks:
 
-                # Get bounding box
+                # Bounding box
                 x_coords = [lm.x * w for lm in hand_landmarks]
                 y_coords = [lm.y * h for lm in hand_landmarks]
 
@@ -93,51 +83,74 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
                 hand_crop = frame[y_min:y_max, x_min:x_max]
 
-                if hand_crop.size != 0:
+                # =========================
+                # OPTIMIZED INFERENCE
+                # =========================
+                if hand_crop.size != 0 and frame_count % 3 == 0:
 
-                    hand_crop = cv2.resize(hand_crop, (640, 640))
+                    # 🔥 smaller image = faster
+                    hand_crop = cv2.resize(hand_crop, (320, 320))
 
-                    results = model(hand_crop, conf=0.25)
+                    best_word = None
+                    best_conf = 0
 
-                    # Best prediction
-                    for r in results:
-                        for box in r.boxes:
-                            cls_id = int(box.cls[0])
-                            conf = float(box.conf[0])
-                            label = model.names[cls_id]
+                    # 🔥 run word model less frequently
+                    if frame_count % 2 == 0:
+                        word_results = word_model(hand_crop, conf=0.5)
 
-                            if conf > best_conf:
-                                best_conf = conf
-                                best_label = label
+                        for r in word_results:
+                            for box in r.boxes:
+                                conf = float(box.conf[0])
+                                label = word_model.names[int(box.cls[0])]
+
+                                if conf > best_conf:
+                                    best_conf = conf
+                                    best_word = label
+
+                    # =========================
+                    # WORD DETECTION
+                    # =========================
+                    if best_word and best_conf < 0.6:
+                        cv2.putText(frame, best_word,
+                                    (50, 80),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    2,
+                                    (255, 0, 0),
+                                    4)
+
+                    else:
+                        # =========================
+                        # LETTER DETECTION
+                        # =========================
+                        letter_results = letter_model(hand_crop, conf=0.5)
+
+                        best_letter = None
+                        best_conf_l = 0
+
+                        for r in letter_results:
+                            for box in r.boxes:
+                                conf = float(box.conf[0])
+                                label = letter_model.names[int(box.cls[0])]
+
+                                if conf > best_conf_l:
+                                    best_conf_l = conf
+                                    best_letter = label
+
+                        if best_letter:
+                            cv2.putText(frame, best_letter,
+                                        (50, 80),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        2,
+                                        (0, 255, 0),
+                                        4)
 
                 # Draw bounding box
                 cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0,255,0), 2)
 
-        else:
-            # 🔥 NEW: clear old predictions
-            history.clear()
-
-        # =========================
-        # SMOOTHING + DISPLAY
-        # =========================
-        if best_label and best_conf > 0.5:
-            history.append(best_label)
-
-        # 🔥 NEW: only show if hand exists
-        if hand_detected and len(history) > 0:
-            final_label = max(set(history), key=history.count)
-
-            cv2.putText(frame, final_label,
-                        (50, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        2,
-                        (0,255,0),
-                        4)
-
         # =========================
         # DISPLAY
         # =========================
-        cv2.imshow("ASL Detection", frame)
+        cv2.imshow("ASL Detection (Optimized)", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
